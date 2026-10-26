@@ -1,0 +1,179 @@
+name: Build RikkaHub
+
+# 这个仓库只有一个用途：把 xsun71136-pixel/rikkahub 拉下来编译。
+# 建它的原因：rikkahub 是个 fork，Actions 被 GitHub 关掉了（422 Actions has been disabled），
+# 而 fork 的 Actions 开关只能在网页 Settings 里手动打开，API 改不了。
+# 新建的非 fork 仓库 Actions 默认是开的，所以借它跑同一套 ci/r6 + ci/r8 补丁链。
+# rikkahub 那边一旦重新打开 Actions，这个仓库就可以删掉。
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 10 * * *'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source fork
+        uses: actions/checkout@v4
+        with:
+          repository: xsun71136-pixel/rikkahub
+          ref: master
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Restore patched sources
+        run: |
+          set -euxo pipefail
+          CS=app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
+          WDP=app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/workspace/WorkspaceDetailPage.kt
+          FP=app/src/main/java/me/rerere/rikkahub/ui/components/ai/FilesPicker.kt
+          VM=app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt
+          CP=app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt
+          AR=app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAutoRetryPage.kt
+          MK=app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/MultiKeyConfig.kt
+          CCD=app/src/main/java/me/rerere/rikkahub/ui/components/ai/CompressContextDialog.kt
+
+          # master 上这 3 个是占位符，从基线提交取回真实内容
+          for f in "$CS" "$WDP" "$FP"; do
+            if [ "$(wc -c < "$f")" -lt 1000 ]; then
+              echo "restore baseline: $f"
+              git checkout 9f8861c6 -- "$f"
+            fi
+          done
+
+          # 轮 1-5 的补丁（FilesPicker 由轮 6 的 04a/04b 整体改写，不再叠加）
+          perl patches/apply_patch.pl patches/0001-chatservice-compress.patch "$CS"
+          perl patches/apply_patch.pl patches/0003-chatservice-autocompress-fix.patch "$CS"
+          cat patches/0002-wdp-a.patch patches/0002-wdp-b.patch > /tmp/wdp.patch
+          perl patches/apply_patch.pl /tmp/wdp.patch "$WDP"
+
+          # 轮 6/7 的 14 段改造脚本
+          for s in 01-chatvm 02a-service 02b-service 03a-chatpage 03b-chatpage \
+                   04a-filespicker 04b-filespicker 05-wdp \
+                   06a-autoretry 06b-autoretry 06c-autoretry 06d-autoretry \
+                   07-multikey 07b-multikey-plus; do
+            echo "=== $s ==="
+            bash "ci/r6/$s.sh"
+          done
+
+          # 轮 8 的 8 段：全部按内容锚点定位区间，锚点对不上直接 die，不会像轮 6 那样
+          # 「括号数对得上、能编译，但底部按钮被静默挪错位置」。
+          for s in 11-wdp 12-compress 13-filespicker 14-autoretry \
+                   15-multikey-page 16-multikey-parts 17-version 18-polish; do
+            echo "=== $s ==="
+            perl "ci/r8/$s.pl"
+          done
+
+          echo "--- 校验 ---"
+          grep -c 'compressEvents' "$VM" "$CP" "$CS"
+          grep -c 'CompressEntryCard' "$FP"
+          grep -c 'chat_page_compress_entry_usage' "$FP"
+          grep -c 'configEnabled' "$AR"
+          grep -c 'setting_auto_retry_rhythm_preview' "$AR"
+          grep -c 'MultiKeyTestDialog' "$MK"
+          grep -c 'MultiKeyImportSheet' "$MK"
+          grep -c 'multi_key_batch_test' "$MK"
+          grep -c 'weight(1f, fill = false)' "$MK"
+          grep -c 'DialogProperties(usePlatformDefaultWidth = false)' "$CCD"
+          grep -c 'FILES(HugeIcons.File02' "$WDP"
+          grep -c 'workspace_detail_exit_select' "$WDP"
+          grep -c 'zipNameTemplate.format' "$WDP"
+          grep -c '3.1.1-r8' app/build.gradle.kts
+          wc -l "$CS" "$WDP" "$FP" "$VM" "$CP" "$AR" "$MK"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'jetbrains'
+          java-version: '21'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web-ui/pnpm-lock.yaml
+
+      - name: Install web-ui dependencies
+        working-directory: web-ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+
+      - name: Prepare build files
+        run: |
+          cat > app/google-services.json << 'GS_JSON_EOF'
+          {
+            "project_info": {
+              "project_number": "100000000000",
+              "project_id": "rikkahub-ci-placeholder",
+              "storage_bucket": "rikkahub-ci-placeholder.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:100000000000:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "me.rerere.rikkahub"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  {
+                    "current_key": "AIzaCyCiPLaCeHoLdErKeYFoRuNsIgNeDbUiLd00"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          GS_JSON_EOF
+
+      - name: Run ai module unit tests
+        run: ./gradlew :ai:test
+
+      - name: Gradle Build
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleGithubRelease
+
+      - name: Publish unsigned APKs
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: nightly
+          name: RikkaHub 3.1.1-r8 (unsigned)
+          prerelease: true
+          body: |
+            由 `rikkahub-ci` 构建。源码来自 `xsun71136-pixel/rikkahub@master`，commit `${{ github.sha }}`。
+
+            未签名，需要自己签：
+            ```
+            apksigner sign --ks your.keystore --ks-key-alias yourAlias \
+              --min-sdk-version 26 --v2-signing-enabled true --v3-signing-enabled true \
+              --out signed.apk app-github-arm64-v8a-release-unsigned.apk
+            ```
+          files: |
+            app/build/outputs/apk/github/release/*.apk
+            app/build/outputs/mapping/githubRelease/mapping.txt
